@@ -1,0 +1,17 @@
+services:
+  qa-agent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      - HEADLESS_BROWSER=${HEADLESS_BROWSER:-true}
+      - API_KEY=${API_KEY:-}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-localhost,127.0.0.1}
+      - ALLOWED_URL_HOSTS=${ALLOWED_URL_HOSTS:-}
+      - MAX_CONCURRENT_RUNS=${MAX_CONCURRENT_RUNS:-2}
+      - MAX_STORED_RUNS=${MAX_STORED_RUNS:-1000}
+      - SCREENSHOTS_ENABLED=${SCREENSHOTS_ENABLED:-false}
+    # Chromium inside a container needs this to avoid /dev/shm crashes.
+    shm_size: "1gb"
