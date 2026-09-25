@@ -22,17 +22,17 @@ POST /test-runs  ──►  in-memory run store  ──►  background task
                                               QAAgent.run(test_case)
                                                        │
                               ┌────────────────────────┴───────────────────┐
-                              │              LangGraph graph                │
-                              │                                             │
-                              │   plan_step ──► execute_step ──► (loop)     │
+                              │              LangGraph graph               │
+                              │                                            │
+                              │   plan_step ──► execute_step ──► (loop)    │
                               │       ▲               │                    │
                               │       └───────────────┘                    │
-                              │                        │                   │
-                              │                   (steps done/error)       │
-                              │                        ▼                   │
-                              │                     verify ──► END         │
-                              └─────────────────────────────────────────────┘
-                                       │                    │
+                              │                       │                    │
+                              │               (steps done/error)           │
+                              │                       ▼                    │
+                              │                  verify ──► END            │
+                              └────────────────────────────────────────────┘
+                                       │                        │
                                  Gemini (plan/verify)   Playwright (act)
 ```
 
