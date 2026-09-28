@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>QA Test-Execution Agent</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, Segoe UI, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 1.3rem; }
+  label { display: block; margin-top: 12px; font-size: 0.85rem; font-weight: 600; }
+  input, textarea { width: 100%; box-sizing: border-box; padding: 8px; margin-top: 4px; font-family: inherit; font-size: 0.9rem; }
+  textarea { min-height: 90px; }
+  button { margin-top: 16px; padding: 10px 18px; font-size: 0.9rem; cursor: pointer; }
+  #result { margin-top: 24px; padding: 16px; border-radius: 6px; border: 1px solid #8884; display: none; }
+  .status { font-weight: 700; text-transform: uppercase; font-size: 0.8rem; padding: 2px 8px; border-radius: 4px; }
+  .queued, .running { background: #8883; }
+  .passed { background: #2a6; color: white; }
+  .failed, .error { background: #c33; color: white; }
+  .step { padding: 8px 0; border-top: 1px solid #8882; font-size: 0.85rem; }
+  .step.fail { color: #c33; }
+</style>
+</head>
+<body>
+  <h1>QA Test-Execution Agent</h1>
+  <p style="opacity:0.7; font-size:0.85rem;">Submit a test case, watch it run against a real browser via the LangGraph agent.</p>
+
+  <label>Title</label>
+  <input id="title" value="User can log in with valid credentials" />
+
+  <label>Start URL</label>
+  <input id="start_url" value="https://example.com/login" />
+
+  <label>Steps (one per line)</label>
+  <textarea id="steps">Enter 'demo_user' into the username field
+Click the login button</textarea>
+
+  <label>Expected result</label>
+  <input id="expected_result" value="The dashboard page is shown with a welcome message" />
+
+  <button id="submit">Run test</button>
+
+  <div id="result">
+    <div><span id="status" class="status"></span></div>
+    <p id="reason" style="font-size:0.9rem;"></p>
+    <div id="steps-out"></div>
+  </div>
+
+<script>
+const API_BASE = ""; // same origin as this page
+
+document.getElementById("submit").addEventListener("click", async () => {
+  const btn = document.getElementById("submit");
+  const result = document.getElementById("result");
+  btn.disabled = true;
+  btn.textContent = "Running...";
+  result.style.display = "block";
+  document.getElementById("status").textContent = "queued";
+  document.getElementById("status").className = "status queued";
+  document.getElementById("reason").textContent = "";
+  document.getElementById("steps-out").innerHTML = "";
+
+  const payload = {
+    test_case: {
+      title: document.getElementById("title").value,
+      start_url: document.getElementById("start_url").value,
+      steps: document.getElementById("steps").value.split("\n").map(s => s.trim()).filter(Boolean),
+      expected_result: document.getElementById("expected_result").value
+    }
+  };
+
+  try {
+    const createRes = await fetch(`${API_BASE}/test-runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!createRes.ok) throw new Error(`Request failed: ${createRes.status}`);
+    const created = await createRes.json();
+    await poll(created.run_id);
+  } catch (err) {
+    document.getElementById("status").textContent = "client error";
+    document.getElementById("status").className = "status error";
+    document.getElementById("reason").textContent = err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Run test";
+  }
+});
+
+async function poll(runId) {
+  const terminal = new Set(["passed", "failed", "error"]);
+  for (let i = 0; i < 60; i++) {
+    const res = await fetch(`${API_BASE}/test-runs/${runId}`);
+    const data = await res.json();
+    render(data);
+    if (terminal.has(data.status)) return;
+    await new Promise(r => setTimeout(r, 2000));
+  }
+}
+
+function render(data) {
+  const statusEl = document.getElementById("status");
+  statusEl.textContent = data.status;
+  statusEl.className = `status ${data.status}`;
+  document.getElementById("reason").textContent = data.verdict_reason || data.error || "";
+
+  const stepsOut = document.getElementById("steps-out");
+  stepsOut.innerHTML = "";
+  (data.step_results || []).forEach(s => {
+    const div = document.createElement("div");
+    div.className = "step" + (s.success ? "" : " fail");
+    div.textContent = `${s.success ? "✓" : "✗"} ${s.step} — ${s.action_taken}`;
+    stepsOut.appendChild(div);
+  });
+}
+</script>
+</body>
+</html>
