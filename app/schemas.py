@@ -57,6 +57,7 @@ class StepResult(BaseModel):
     action_taken: str
     success: bool
     detail: str = ""
+    duration_ms: int = 0
 
 
 class TestRunResult(BaseModel):
@@ -66,3 +67,7 @@ class TestRunResult(BaseModel):
     step_results: list[StepResult] = Field(default_factory=list)
     verdict_reason: str = ""
     error: Optional[str] = None
+    duration_seconds: float = 0.0
+    llm_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
