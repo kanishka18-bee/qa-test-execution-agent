@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Literal, Optional, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -60,25 +61,26 @@ with ONLY a JSON object:
 
 No prose, only JSON."""
 
-# Total wall-clock budget for one test run (all steps + verify). Kept
-# separate from BROWSER_TIMEOUT_MS (the per-selector wait in
-# browser_executor) since this caps the whole graph, not one action.
-RUN_TIMEOUT_SECONDS = 60
+# Total wall-clock budget for one test run (all steps + verify). With
+# max_retries=0 and a 12s per-call LLM timeout, one call fails fast rather
+# than silently retrying — this ceiling exists to bound the browser-side
+# fallback-selector hunting below, not to accommodate retries.
+RUN_TIMEOUT_SECONDS = 120
 
 # Hard ceiling on steps per run, independent of how many the test case has,
 # as a defensive backstop against a runaway loop.
 MAX_STEPS = 10
 
+# Kept short deliberately: each entry costs one real browser_timeout_ms wait
+# when the primary selector fails, so a long list here is what actually made
+# a single failed step slow, not the LLM call.
 CLICK_FALLBACK_SELECTORS = [
     "text=Login",
-    "text=Submit",
-    "text=Sign in",
     "button",
 ]
 
 FILL_FALLBACK_SELECTORS = [
     "input[name='username']",
-    "input[name='email']",
     "input[type='text']",
 ]
 
@@ -91,6 +93,10 @@ class AgentState(TypedDict):
     verdict_reason: str
     error: Optional[str]
     pending_plan: dict
+    step_started_at: float
+    llm_calls: int
+    input_tokens: int
+    output_tokens: int
 
 
 def _get_llm() -> ChatGoogleGenerativeAI:
@@ -99,9 +105,34 @@ def _get_llm() -> ChatGoogleGenerativeAI:
         model=settings.gemini_model,
         google_api_key=settings.gemini_api_key,
         temperature=0,
-        max_retries=1,
-        timeout=20,
+        # Our own try/except around every ainvoke() call already turns a
+        # failure into a clean, fast "failed" result — so the client doesn't
+        # need to silently retry on top of that. A retry here (previously
+        # max_retries=2, timeout=25) could legitimately take up to ~75s for
+        # ONE call alone, which blew straight through RUN_TIMEOUT_SECONDS
+        # before a single call even finished. Fail fast instead; you can
+        # just rerun the test if it was a one-off hiccup.
+        max_retries=0,
+        timeout=12,
     )
+
+
+def _response_text(response) -> str:
+    """Normalize response.content, which some Gemini models return as a
+    plain string and others return as a list of content parts (e.g. when
+    "thinking" output accompanies the actual answer)."""
+    content = response.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                parts.append(str(part.get("text", "")))
+        return "".join(parts)
+    return str(content)
 
 
 def _parse_json_response(raw: str) -> dict:
@@ -117,6 +148,18 @@ def _sanitize_selector(selector: str) -> str:
     if len(selector) > 200:
         return "body"
     return selector.strip()
+
+
+def _elapsed_ms(state: AgentState) -> int:
+    return int((time.perf_counter() - state["step_started_at"]) * 1000)
+
+
+def _record_usage(state: AgentState, response) -> None:
+    """Count one LLM call and add its token usage, when the response reports it."""
+    state["llm_calls"] += 1
+    usage = getattr(response, "usage_metadata", None) or {}
+    state["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
+    state["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
 
 
 class QAAgent:
@@ -144,6 +187,7 @@ class QAAgent:
         return graph.compile()
 
     async def _plan_step(self, state: AgentState) -> AgentState:
+        state["step_started_at"] = time.perf_counter()
         step_text = state["test_case"].steps[state["step_index"]]
         page_text = await self.browser.get_visible_text()
         messages = [
@@ -152,9 +196,23 @@ class QAAgent:
                 content=f"Test step:\n{step_text}\n\nVisible page text:\n{page_text[:2000]}"
             ),
         ]
-        response = await self.llm.ainvoke(messages)
         try:
-            plan = Plan.model_validate(_parse_json_response(response.content)).model_dump()
+            response = await self.llm.ainvoke(messages)
+        except Exception as exc:  # noqa: BLE001 - any LLM/network failure (timeout, 429, 5xx, etc.)
+            # Treat a failed call the same way as a malformed response: no
+            # action to take this step, fail gracefully instead of letting
+            # an arbitrary exception type escape the graph uncaught.
+            # str(exc) can be empty for some exception types (certain client-
+            # side timeouts carry no message) — fall back to the exception's
+            # class name so the verdict is never blank.
+            detail = str(exc) or exc.__class__.__name__
+            state["error"] = f"planner call failed: {detail}"
+            state["pending_plan"] = {"action": "invalid", "selector": "", "text": ""}
+            return state
+
+        _record_usage(state, response)
+        try:
+            plan = Plan.model_validate(_parse_json_response(_response_text(response))).model_dump()
         except (json.JSONDecodeError, AttributeError, TypeError, ValueError) as exc:
             state["error"] = f"planner returned invalid JSON: {exc}"
             plan = {"action": "invalid", "selector": "", "text": ""}
@@ -179,6 +237,7 @@ class QAAgent:
                     action_taken=f"{action} -> [rejected]",
                     success=False,
                     detail=reason,
+                    duration_ms=_elapsed_ms(state),
                 )
             )
             state["error"] = reason
@@ -212,6 +271,7 @@ class QAAgent:
                 action_taken=f"{action} -> {selector}",
                 success=result.success,
                 detail=result.detail,
+                duration_ms=_elapsed_ms(state),
             )
         )
         if not result.success:
@@ -245,9 +305,17 @@ class QAAgent:
                 )
             ),
         ]
-        response = await self.llm.ainvoke(messages)
         try:
-            verdict = _parse_json_response(response.content)
+            response = await self.llm.ainvoke(messages)
+        except Exception as exc:  # noqa: BLE001 - any LLM/network failure (timeout, 429, 5xx, etc.)
+            state["passed"] = False
+            detail = str(exc) or exc.__class__.__name__
+            state["verdict_reason"] = f"verifier call failed: {detail}"
+            return state
+
+        _record_usage(state, response)
+        try:
+            verdict = _parse_json_response(_response_text(response))
             state["passed"] = bool(verdict.get("passed", False))
             state["verdict_reason"] = verdict.get("reason", "")
         except (json.JSONDecodeError, AttributeError) as exc:
@@ -266,6 +334,10 @@ class QAAgent:
                 "verdict_reason": "",
                 "error": None,
                 "pending_plan": {},
+                "step_started_at": 0.0,
+                "llm_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
             }
             final_state = await asyncio.wait_for(
                 self.graph.ainvoke(initial_state), timeout=RUN_TIMEOUT_SECONDS

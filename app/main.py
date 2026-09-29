@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import time
 import uuid
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
@@ -37,6 +38,7 @@ async def _execute_run(run_id: str) -> None:
     async with _RUN_SEMAPHORE:
         result = _RUNS[run_id]
         result.status = RunStatus.RUNNING
+        started = time.perf_counter()
 
         try:
             print("STARTING RUN:", run_id)
@@ -60,6 +62,9 @@ async def _execute_run(run_id: str) -> None:
                 StepResult(**r.model_dump()) for r in final_state["step_results"]
             ]
             result.verdict_reason = final_state.get("verdict_reason", "")
+            result.llm_calls = final_state.get("llm_calls", 0)
+            result.input_tokens = final_state.get("input_tokens", 0)
+            result.output_tokens = final_state.get("output_tokens", 0)
             result.status = RunStatus.PASSED if final_state.get("passed") else RunStatus.FAILED
 
             print("FINISHED RUN:", run_id, "->", result.status)
@@ -68,7 +73,9 @@ async def _execute_run(run_id: str) -> None:
             print("ERROR in run", run_id, ":", str(e))
             result.status = RunStatus.ERROR
             result.error = str(e)
-
+            
+        finally:
+            result.duration_seconds = round(time.perf_counter() - started, 2)
 
 @app.post("/test-runs", response_model=TestRunResult, status_code=202)
 async def create_test_run(
