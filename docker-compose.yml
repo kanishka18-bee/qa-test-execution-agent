@@ -5,7 +5,7 @@ services:
       - "8000:8000"
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
       - HEADLESS_BROWSER=${HEADLESS_BROWSER:-true}
       - API_KEY=${API_KEY:-}
       - ALLOWED_HOSTS=${ALLOWED_HOSTS:-localhost,127.0.0.1}

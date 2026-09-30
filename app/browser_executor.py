@@ -3,71 +3,8 @@
 Kept deliberately small and dependency-injectable so it can be mocked in
 tests without spinning up a real browser.
 """
-# from __future__ import annotations
-
-# from dataclasses import dataclass
-# from typing import Optional
-
-# from playwright.async_api import Browser, Page, async_playwright
-
-
-# @dataclass
-# class ActionResult:
-#     success: bool
-#     detail: str
-
-
-# class BrowserExecutor:
-#     """One instance = one test run's browser session."""
-
-#     def __init__(self, headless: bool = True) -> None:
-#         self._headless = headless
-#         self._playwright = None
-#         self._browser: Optional[Browser] = None
-#         self._page: Optional[Page] = None
-
-#     async def start(self, start_url: str) -> None:
-#         self._playwright = await async_playwright().start()
-#         # Launches Chromium and talks to it over the Chrome DevTools Protocol.
-#         self._browser = await self._playwright.chromium.launch(headless=self._headless)
-#         self._page = await self._browser.new_page()
-#         await self._page.goto(start_url, wait_until="domcontentloaded")
-
-#     async def stop(self) -> None:
-#         if self._browser:
-#             await self._browser.close()
-#         if self._playwright:
-#             await self._playwright.stop()
-
-#     async def click(self, selector: str) -> ActionResult:
-#         try:
-#             await self._page.click(selector, timeout=5000)
-#             return ActionResult(True, f"clicked {selector}")
-#         except Exception as exc:  # noqa: BLE001 - surface any Playwright error uniformly
-#             return ActionResult(False, f"click failed on {selector}: {exc}")
-
-#     async def fill(self, selector: str, text: str) -> ActionResult:
-#         try:
-#             await self._page.fill(selector, text, timeout=5000)
-#             return ActionResult(True, f"filled {selector} with '{text}'")
-#         except Exception as exc:  # noqa: BLE001
-#             return ActionResult(False, f"fill failed on {selector}: {exc}")
-
-#     async def get_visible_text(self) -> str:
-#         """Cheap page snapshot handed to the LLM for planning/verification."""
-#         try:
-#             body = await self._page.inner_text("body")
-#             return body[:4000]
-#         except Exception as exc:  # noqa: BLE001
-#             return f"[could not read page text: {exc}]"
-
-#     async def current_url(self) -> str:
-#         return self._page.url if self._page else ""
-
-
 from __future__ import annotations
 
-import asyncio
 import ipaddress
 import socket
 from dataclasses import dataclass
@@ -86,6 +23,14 @@ class ActionResult:
 
 
 class BrowserExecutor:
+    """One instance = one test run's browser session.
+
+    Owns the full Playwright lifecycle (start -> actions -> stop). Callers
+    should call start() exactly once and stop() exactly once — QAAgent.run()
+    already does this; don't also call start()/stop() around it, or you'll
+    launch two browsers per run and leak the first one.
+    """
+
     def __init__(self, headless: bool = True) -> None:
         self._headless = headless
         self._settings = get_settings()
@@ -94,6 +39,7 @@ class BrowserExecutor:
         self._page: Optional[Page] = None
 
     async def start(self, start_url: str) -> None:
+        start_url = str(start_url)
         self._validate_url(start_url)
         self._playwright = await async_playwright().start()
         try:
@@ -125,47 +71,35 @@ class BrowserExecutor:
 
     async def click(self, selector: str) -> ActionResult:
         page = self._ensure_page()
-
-        for attempt in range(3):
-            try:
-                await page.wait_for_selector(selector, timeout=self._settings.browser_timeout_ms)
-                await page.click(selector, timeout=self._settings.browser_timeout_ms)
-
-                # wait for possible navigation
-                await page.wait_for_load_state("networkidle", timeout=5000)
-
-                await self._screenshot(f"click_{attempt}.png")
-
-                return ActionResult(True, f"clicked {selector}")
-            except Exception as exc:
-                if attempt == 2:
-                    return ActionResult(False, f"click failed on {selector}: {exc}")
-                await asyncio.sleep(1)
+        try:
+            await page.wait_for_selector(selector, timeout=self._settings.browser_timeout_ms)
+            await page.click(selector, timeout=self._settings.browser_timeout_ms)
+            # Give a possible navigation a moment to settle, but don't let it
+            # eat the whole budget if nothing was actually navigating.
+            await page.wait_for_load_state("domcontentloaded", timeout=min(5000, self._settings.browser_timeout_ms))
+            await self._screenshot("click.png")
+            return ActionResult(True, f"clicked {selector}")
+        except Exception as exc:  # noqa: BLE001 - surface any Playwright error uniformly
+            return ActionResult(False, f"click failed on {selector}: {exc}")
 
     async def fill(self, selector: str, text: str) -> ActionResult:
         page = self._ensure_page()
-
-        for attempt in range(3):
-            try:
-                await page.wait_for_selector(selector, timeout=self._settings.browser_timeout_ms)
-                await page.fill(selector, text, timeout=self._settings.browser_timeout_ms)
-
-                await self._screenshot(f"fill_{attempt}.png")
-
-                return ActionResult(True, f"filled {selector} with '{text}'")
-            except Exception as exc:
-                if attempt == 2:
-                    return ActionResult(False, f"fill failed on {selector}: {exc}")
-                await asyncio.sleep(1)
+        try:
+            await page.wait_for_selector(selector, timeout=self._settings.browser_timeout_ms)
+            await page.fill(selector, text, timeout=self._settings.browser_timeout_ms)
+            await self._screenshot("fill.png")
+            return ActionResult(True, f"filled {selector} with '{text}'")
+        except Exception as exc:  # noqa: BLE001
+            return ActionResult(False, f"fill failed on {selector}: {exc}")
 
     async def get_visible_text(self) -> str:
+        """Cheap page snapshot handed to the LLM for planning/verification."""
         page = self._ensure_page()
-
         try:
             await page.wait_for_load_state("domcontentloaded")
             body = await page.inner_text("body")
-            return body[:3000]  # limit size for LLM
-        except Exception as exc:
+            return body[:3000]
+        except Exception as exc:  # noqa: BLE001
             return f"[could not read page text: {exc}]"
 
     async def current_url(self) -> str:
@@ -177,10 +111,13 @@ class BrowserExecutor:
         try:
             page = self._ensure_page()
             await page.screenshot(path=f"screenshots/{name}", animations="disabled")
-        except Exception:
+        except Exception:  # noqa: BLE001 - screenshots are a nice-to-have, never fail the run over one
             pass
 
     def _validate_url(self, url: str) -> None:
+        """Basic SSRF guard: only http(s), no embedded creds, must resolve to
+        a public IP (or be explicitly allowlisted via ALLOWED_URL_HOSTS)."""
+        url = str(url)
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
             raise ValueError("start_url must be an HTTP(S) URL without embedded credentials")
