@@ -79,6 +79,7 @@
   .verdict-label { font-size: 0.78rem; color: var(--ink-soft); margin-bottom: 6px; }
   .verdict-text.pass { color: var(--pass); }
   .verdict-text.fail { color: var(--fail); }
+  .fallback-note { margin-top: 8px; font-size: 0.78rem; color: var(--signal); }
 </style>
 </head>
 <body>
@@ -128,6 +129,7 @@ Click the login button</textarea>
       <div class="verdict" id="verdict-wrap" style="display:none">
         <div class="verdict-label">Verdict</div>
         <div class="verdict-text mono" id="verdict-text"></div>
+        <div class="fallback-note mono" id="fallback-note" style="display:none">used backup model (primary failed)</div>
       </div>
     </div>
 
@@ -148,6 +150,7 @@ document.getElementById("submit").addEventListener("click", async () => {
   document.getElementById("run-head-wrap").style.display = "block";
   document.getElementById("steps-out").innerHTML = "";
   document.getElementById("verdict-wrap").style.display = "none";
+  document.getElementById("fallback-note").style.display = "none";
   setStatus("queued");
 
   const startedAt = performance.now();
@@ -232,6 +235,7 @@ function render(data) {
     wrap.style.display = "block";
     text.textContent = data.verdict_reason || data.error || "—";
     text.className = "verdict-text mono " + (data.status === "passed" ? "pass" : "fail");
+    document.getElementById("fallback-note").style.display = data.used_fallback ? "block" : "none";
   }
 }
 

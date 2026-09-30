@@ -65,6 +65,7 @@ async def _execute_run(run_id: str) -> None:
             result.llm_calls = final_state.get("llm_calls", 0)
             result.input_tokens = final_state.get("input_tokens", 0)
             result.output_tokens = final_state.get("output_tokens", 0)
+            result.used_fallback = final_state.get("used_fallback", False)
             result.status = RunStatus.PASSED if final_state.get("passed") else RunStatus.FAILED
 
             print("FINISHED RUN:", run_id, "->", result.status)
@@ -73,9 +74,10 @@ async def _execute_run(run_id: str) -> None:
             print("ERROR in run", run_id, ":", str(e))
             result.status = RunStatus.ERROR
             result.error = str(e)
-            
+
         finally:
             result.duration_seconds = round(time.perf_counter() - started, 2)
+
 
 @app.post("/test-runs", response_model=TestRunResult, status_code=202)
 async def create_test_run(

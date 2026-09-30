@@ -1,8 +1,9 @@
-fastapi>=0.115
+﻿fastapi>=0.115
 uvicorn[standard]>=0.30
 langgraph>=0.2
 langchain-core>=0.3
 langchain-google-genai>=2.0
+langchain-groq>=0.2
 playwright>=1.45
 pydantic>=2.7
 python-dotenv>=1.0

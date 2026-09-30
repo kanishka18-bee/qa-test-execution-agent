@@ -65,7 +65,12 @@ No prose, only JSON."""
 # max_retries=0 and a 12s per-call LLM timeout, one call fails fast rather
 # than silently retrying — this ceiling exists to bound the browser-side
 # fallback-selector hunting below, not to accommodate retries.
-RUN_TIMEOUT_SECONDS = 120
+RUN_TIMEOUT_SECONDS = 45
+
+# Enforced ourselves via asyncio.wait_for around every ainvoke() call — not
+# just passed as a `timeout=` kwarg to the client, which we can't fully
+# trust to cut off a genuinely stalled network call.
+LLM_CALL_TIMEOUT_SECONDS = 15
 
 # Hard ceiling on steps per run, independent of how many the test case has,
 # as a defensive backstop against a runaway loop.
@@ -97,6 +102,7 @@ class AgentState(TypedDict):
     llm_calls: int
     input_tokens: int
     output_tokens: int
+    used_fallback: bool
 
 
 def _get_llm() -> ChatGoogleGenerativeAI:
@@ -112,6 +118,24 @@ def _get_llm() -> ChatGoogleGenerativeAI:
         # ONE call alone, which blew straight through RUN_TIMEOUT_SECONDS
         # before a single call even finished. Fail fast instead; you can
         # just rerun the test if it was a one-off hiccup.
+        max_retries=0,
+        timeout=12,
+    )
+
+
+def _get_fallback_llm():
+    """Groq, used only when the primary (Gemini) call fails. Returns None
+    when no GROQ_API_KEY is configured, so the fallback is fully optional —
+    everything works exactly as before if you never set one."""
+    settings = get_settings()
+    if not settings.groq_api_key:
+        return None
+    from langchain_groq import ChatGroq  # imported lazily: optional dependency
+
+    return ChatGroq(
+        model=settings.groq_model,
+        api_key=settings.groq_api_key,
+        temperature=0,
         max_retries=0,
         timeout=12,
     )
@@ -165,10 +189,43 @@ def _record_usage(state: AgentState, response) -> None:
 class QAAgent:
     """Wraps the compiled LangGraph graph plus the browser session it drives."""
 
-    def __init__(self, browser: BrowserExecutor, llm: Optional[ChatGoogleGenerativeAI] = None):
+    def __init__(
+        self,
+        browser: BrowserExecutor,
+        llm: Optional[ChatGoogleGenerativeAI] = None,
+        fallback_llm=None,
+    ):
         self.browser = browser
         self.llm = llm or _get_llm()
+        # fallback_llm=None (the default) means "use whatever GROQ_API_KEY
+        # says" — pass fallback_llm=False explicitly (not None) in tests that
+        # want to verify no-fallback-configured behavior without touching env.
+        self.fallback_llm = _get_fallback_llm() if fallback_llm is None else (fallback_llm or None)
         self.graph = self._build_graph()
+
+    async def _invoke_with_fallback(self, messages):
+        """Try the primary model; on any failure — including a hang, which
+        we enforce ourselves via asyncio.wait_for rather than trusting the
+        client's own `timeout=` kwarg to actually cut a stalled network call
+        off — try the fallback once before giving up. Returns
+        (response, used_fallback)."""
+        try:
+            response = await asyncio.wait_for(
+                self.llm.ainvoke(messages), timeout=LLM_CALL_TIMEOUT_SECONDS
+            )
+            return response, False
+        except Exception as primary_exc:  # noqa: BLE001
+            if self.fallback_llm is None:
+                raise
+            try:
+                response = await asyncio.wait_for(
+                    self.fallback_llm.ainvoke(messages), timeout=LLM_CALL_TIMEOUT_SECONDS
+                )
+                return response, True
+            except Exception as fallback_exc:  # noqa: BLE001
+                d1 = str(primary_exc) or primary_exc.__class__.__name__
+                d2 = str(fallback_exc) or fallback_exc.__class__.__name__
+                raise RuntimeError(f"primary failed ({d1}); fallback failed ({d2})") from fallback_exc
 
     def _build_graph(self):
         graph = StateGraph(AgentState)
@@ -197,7 +254,7 @@ class QAAgent:
             ),
         ]
         try:
-            response = await self.llm.ainvoke(messages)
+            response, used_fallback = await self._invoke_with_fallback(messages)
         except Exception as exc:  # noqa: BLE001 - any LLM/network failure (timeout, 429, 5xx, etc.)
             # Treat a failed call the same way as a malformed response: no
             # action to take this step, fail gracefully instead of letting
@@ -210,6 +267,8 @@ class QAAgent:
             state["pending_plan"] = {"action": "invalid", "selector": "", "text": ""}
             return state
 
+        if used_fallback:
+            state["used_fallback"] = True
         _record_usage(state, response)
         try:
             plan = Plan.model_validate(_parse_json_response(_response_text(response))).model_dump()
@@ -306,13 +365,15 @@ class QAAgent:
             ),
         ]
         try:
-            response = await self.llm.ainvoke(messages)
+            response, used_fallback = await self._invoke_with_fallback(messages)
         except Exception as exc:  # noqa: BLE001 - any LLM/network failure (timeout, 429, 5xx, etc.)
             state["passed"] = False
             detail = str(exc) or exc.__class__.__name__
             state["verdict_reason"] = f"verifier call failed: {detail}"
             return state
 
+        if used_fallback:
+            state["used_fallback"] = True
         _record_usage(state, response)
         try:
             verdict = _parse_json_response(_response_text(response))
@@ -338,6 +399,7 @@ class QAAgent:
                 "llm_calls": 0,
                 "input_tokens": 0,
                 "output_tokens": 0,
+                "used_fallback": False,
             }
             final_state = await asyncio.wait_for(
                 self.graph.ainvoke(initial_state), timeout=RUN_TIMEOUT_SECONDS
@@ -352,6 +414,7 @@ class QAAgent:
                 "verdict_reason": f"test run timed out after {RUN_TIMEOUT_SECONDS}s",
                 "error": f"timeout after {RUN_TIMEOUT_SECONDS} seconds",
                 "pending_plan": {},
+                "used_fallback": False,
             }
         finally:
             await self.browser.stop()

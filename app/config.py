@@ -13,6 +13,8 @@ class Settings:
     def __init__(self) -> None:
         self.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
         self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+        self.groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
+        self.groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
         self.headless_browser = os.getenv("HEADLESS_BROWSER", "true").lower() != "false"
         self.api_key = os.getenv("API_KEY", "").strip()
         self.allowed_hosts = [

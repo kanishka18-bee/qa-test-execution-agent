@@ -16,27 +16,15 @@ class RunStatus(str, Enum):
 
 
 class TestCase(BaseModel):
-    """Mirrors the shape of a Zephyr/Jira test case closely enough to swap
-    in a real integration later without changing the agent."""
-
-    title: str = Field(..., min_length=1, max_length=200, examples=["User can log in with valid credentials"])
-    start_url: HttpUrl = Field(..., examples=["https://example.com/login"])
+    title: str = Field(..., min_length=1, max_length=200)
+    start_url: HttpUrl = Field(...)
     steps: list[Annotated[str, Field(min_length=1, max_length=1000)]] = Field(
-        ...,
-        min_length=1,
-        max_length=25,
-        examples=[[
-            "Enter 'demo_user' into the username field",
-            "Enter 'correct_password' into the password field",
-            "Click the login button",
-        ]],
+        ..., min_length=1, max_length=25,
     )
     expected_result: str = Field(..., min_length=1, max_length=2000)
     jira_issue_key: Optional[str] = Field(
         default=None, max_length=32, pattern=r"^[A-Za-z][A-Za-z0-9_-]*$",
-        description="e.g. QA-123, for correlating back to Jira/Zephyr"
     )
-
     model_config = {"str_strip_whitespace": True}
 
 
@@ -44,7 +32,6 @@ class Plan(BaseModel):
     action: str = Field(..., pattern=r"^(click|fill)$")
     selector: str = Field(..., min_length=1, max_length=500)
     text: str = Field(default="", max_length=2000)
-
     model_config = {"extra": "forbid", "str_strip_whitespace": True}
 
 
@@ -71,3 +58,4 @@ class TestRunResult(BaseModel):
     llm_calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    used_fallback: bool = False
