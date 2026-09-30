@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import time
 import uuid
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.agent import QAAgent
 from app.browser_executor import BrowserExecutor
@@ -13,6 +15,7 @@ from app.config import get_settings
 from app.schemas import RunStatus, StepResult, TestRunRequest, TestRunResult
 
 app = FastAPI(title="QA Test-Execution Agent")
+app.mount("/ui", StaticFiles(directory="static", html=True), name="ui")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=get_settings().allowed_hosts)
 
 # In-memory store for the take-home scope. Swap for Redis/Postgres to persist
@@ -31,55 +34,50 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 
-# async def _execute_run(run_id: str) -> None:
-#     async with _RUN_SEMAPHORE:
-#         result = _RUNS[run_id]
-#         result.status = RunStatus.RUNNING
-#         settings = get_settings()
-#         browser = BrowserExecutor(headless=settings.headless_browser)
-#         agent = QAAgent(browser=browser)
-#         try:
-#             final_state = await agent.run(result.test_case)
-#             result.step_results = [StepResult(**r.model_dump()) for r in final_state["step_results"]]
-#             result.verdict_reason = final_state.get("verdict_reason", "")
-#             result.status = RunStatus.PASSED if final_state.get("passed") else RunStatus.FAILED
-#         except Exception:
-#             result.status = RunStatus.ERROR
-#             result.error = "test run failed; inspect server logs for details"
-
 async def _execute_run(run_id: str) -> None:
     async with _RUN_SEMAPHORE:
         result = _RUNS[run_id]
         result.status = RunStatus.RUNNING
-
-        settings = get_settings()
-        browser = BrowserExecutor(headless=settings.headless_browser)
-        agent = QAAgent(browser=browser)
+        started = time.perf_counter()
 
         try:
-            print("🚀 STARTING RUN:", run_id)
+            print("STARTING RUN:", run_id)
 
-            # ✅ START browser
-            await browser.start(result.test_case.start_url)
+            settings = get_settings()
+            browser = BrowserExecutor(headless=settings.headless_browser)
+            # Constructing QAAgent builds the LLM client, which validates the
+            # API key immediately — this must be inside the try block, or a
+            # bad/missing key throws here and the run silently dies while
+            # stuck at status=RUNNING forever (nothing ever catches it).
+            agent = QAAgent(browser=browser)
 
+            # QAAgent.run() owns the full browser lifecycle (start + stop
+            # in its own try/finally) — do NOT call browser.start()/stop()
+            # here too. Doing both launches two Chromium instances per run
+            # and leaks the first one, since only the second reference
+            # survives to be closed.
             final_state = await agent.run(result.test_case)
 
             result.step_results = [
                 StepResult(**r.model_dump()) for r in final_state["step_results"]
             ]
             result.verdict_reason = final_state.get("verdict_reason", "")
+            result.llm_calls = final_state.get("llm_calls", 0)
+            result.input_tokens = final_state.get("input_tokens", 0)
+            result.output_tokens = final_state.get("output_tokens", 0)
+            result.used_fallback = final_state.get("used_fallback", False)
             result.status = RunStatus.PASSED if final_state.get("passed") else RunStatus.FAILED
 
-            print("✅ FINISHED RUN:", run_id)
+            print("FINISHED RUN:", run_id, "->", result.status)
 
-        except Exception as e:
-            print("❌ ERROR:", str(e))
+        except Exception as e:  # noqa: BLE001 - surface any failure as a run error
+            print("ERROR in run", run_id, ":", str(e))
             result.status = RunStatus.ERROR
             result.error = str(e)
 
         finally:
-            # ✅ ALWAYS stop browser
-            await browser.stop()
+            result.duration_seconds = round(time.perf_counter() - started, 2)
+
 
 @app.post("/test-runs", response_model=TestRunResult, status_code=202)
 async def create_test_run(
@@ -90,6 +88,11 @@ async def create_test_run(
     settings = get_settings()
     if settings.api_key and api_key != settings.api_key:
         raise HTTPException(status_code=401, detail="authentication required")
+
+    # Fast, shallow pre-check on literal IP/localhost hosts. The thorough
+    # check (DNS resolution + public-IP check) happens in
+    # BrowserExecutor._validate_url right before the browser actually
+    # navigates there — this one just fails obviously-bad requests early.
     hostname = request.test_case.start_url.host.lower().rstrip(".")
     try:
         host_is_private = not ipaddress.ip_address(hostname).is_global
@@ -97,6 +100,7 @@ async def create_test_run(
         host_is_private = hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".local")
     if host_is_private:
         raise HTTPException(status_code=400, detail="start_url host is not allowed")
+
     run_id = str(uuid.uuid4())
     result = TestRunResult(run_id=run_id, status=RunStatus.QUEUED, test_case=request.test_case)
     async with _RUNS_LOCK:
